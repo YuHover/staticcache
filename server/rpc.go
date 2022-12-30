@@ -7,7 +7,7 @@ import (
 )
 
 type RPCRequest struct {
-    GroupName string
+    CacheName string
     Key       string
 }
 
@@ -38,18 +38,26 @@ func NewRPCServer(address string, opts ...RPCOption) *RPCServer {
     return rs
 }
 
+func (rs *RPCServer) GetName() string {
+    return rs.name
+}
+
+func (rs *RPCServer) GetSchema() string {
+    return "rpc"
+}
+
 func (rs *RPCServer) ServeRPC(in RPCRequest, out *RPCResponse) error {
-    groupName, key := in.GroupName, in.Key
-    if groupName == "" || key == "" {
-        return fmt.Errorf("bad request, want group name and key")
+    cacheName, key := in.CacheName, in.Key
+    if cacheName == "" || key == "" {
+        return fmt.Errorf("bad request, want static cache name and key")
     }
 
-    group := staticcache.GetGroup(groupName)
-    if group == nil {
-        return fmt.Errorf("no such group: %s", groupName)
+    static := staticcache.GetCache(cacheName)
+    if static == nil {
+        return fmt.Errorf("no such static cache: %s", cacheName)
     }
 
-    bv, err := group.Get(key)
+    bv, err := static.Get(key)
     if err != nil {
         return fmt.Errorf("internal error: %v", err)
     }
@@ -58,13 +66,9 @@ func (rs *RPCServer) ServeRPC(in RPCRequest, out *RPCResponse) error {
     return nil
 }
 
-func (rs *RPCServer) GetName() string {
-    return rs.name
-}
-
-func (rs *RPCServer) Get(groupName string, key string) ([]byte, error) {
-    if groupName == "" || key == "" {
-        return nil, fmt.Errorf("want group name and key")
+func (rs *RPCServer) Get(cacheName string, key string) ([]byte, error) {
+    if cacheName == "" || key == "" {
+        return nil, fmt.Errorf("want static cache name and key")
     }
 
     client, err := rpc.Dial("tcp", rs.address)
@@ -73,7 +77,7 @@ func (rs *RPCServer) Get(groupName string, key string) ([]byte, error) {
     }
 
     res := &RPCResponse{}
-    err = client.Call(rs.name+".ServeRPC", RPCRequest{GroupName: groupName, Key: key}, res)
+    err = client.Call(rs.name+".ServeRPC", RPCRequest{CacheName: cacheName, Key: key}, res)
     if err != nil {
         return nil, fmt.Errorf("remote server error: %v", err)
     }

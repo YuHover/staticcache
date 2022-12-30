@@ -6,85 +6,62 @@ import (
     "sync"
 )
 
-type LocalGetter interface {
-    Get(key string) ([]byte, error)
-}
-
-// A GetterFunc implements LocalGetter with a function.
-type GetterFunc func(key string) ([]byte, error)
-
-// Get implements LocalGetter interface function
-func (f GetterFunc) Get(key string) ([]byte, error) {
-    return f(key)
-}
-
-type Group struct {
+// StaticCache provides static resource cache service.
+type StaticCache struct {
     name      string
     limit     int64
-    mainCache *cache
+    mainCache *syncLRU
     getter    LocalGetter
-    picker    Picker
+    picker    *ConsistentPicker
     throttle  *singleflight.SingleFlight
 }
 
-var (
-    mu     sync.RWMutex
-    groups = make(map[string]*Group)
-)
+var caches = make(map[string]*StaticCache)
 
-// NewGroup create a new instance of Group
-func NewGroup(name string, limit int64, getter LocalGetter) *Group {
+func NewStaticCache(name string, limit int64, getter LocalGetter) *StaticCache {
     if getter == nil {
-        panic("nil LocalGetter")
+        panic("must provide local getter")
     }
 
-    mu.Lock()
-    defer mu.Unlock()
-
-    if _, dup := groups[name]; dup {
-        panic("duplicate registration of group " + name)
+    if _, dup := caches[name]; dup {
+        panic("duplicate registration of cache: " + name)
     }
 
-    g := &Group{
+    sc := &StaticCache{
         name:      name,
         getter:    getter,
-        mainCache: &cache{},
+        mainCache: &syncLRU{},
         limit:     limit,
         throttle:  &singleflight.SingleFlight{},
     }
-    groups[name] = g
-    return g
+    caches[name] = sc
+    return sc
 }
 
-func (g *Group) RegisterPicker(picker Picker) {
-    g.picker = picker
+func GetCache(name string) *StaticCache {
+    return caches[name]
 }
 
-// GetGroup returns the named group previously created with NewGroup, or
-// nil if there's no such group.
-func GetGroup(name string) *Group {
-    mu.RLock()
-    defer mu.RUnlock()
-
-    return groups[name]
+func (sc *StaticCache) SetConsistentPicker(picker *ConsistentPicker) {
+    sc.picker = picker
 }
 
-func (g *Group) Get(key string) (byteView, error) {
-    if bv, hit := g.mainCache.get(key); hit {
+func (sc *StaticCache) Get(key string) (byteView, error) {
+    if bv, hit := sc.mainCache.get(key); hit {
         return bv, nil
     }
 
     // single flight
-    bv, err := g.throttle.Throttle(key, func() (any, error) {
-        if g.picker != nil {
-            if remote := g.picker.PickServer(key); remote != nil {
-                if bv, err := g.getFromRemote(remote, key); err == nil {
+    bv, err := sc.throttle.Throttle(key, func() (any, error) {
+        if sc.picker != nil {
+            if remote := sc.picker.PickServer(key); remote != nil {
+                if bv, err := sc.getFromRemote(remote, key); err == nil {
                     return bv, nil
                 }
             }
         }
 
-        return g.getLocally(key)
+        return sc.getLocally(key)
     })
 
     if err == nil {
@@ -93,79 +70,91 @@ func (g *Group) Get(key string) (byteView, error) {
     return byteView{}, err
 }
 
-func (g *Group) getFromRemote(remote RemoteServer, key string) (byteView, error) {
-    bs, err := remote.Get(g.name, key)
+func (sc *StaticCache) getFromRemote(remote CacheServer, key string) (byteView, error) {
+    bs, err := remote.Get(sc.name, key)
     if err != nil {
         return byteView{}, err
     }
     return byteView{bs: bs}, nil
 }
 
-func (g *Group) getLocally(key string) (byteView, error) {
-    bs, err := g.getter.Get(key)
+func (sc *StaticCache) getLocally(key string) (byteView, error) {
+    bs, err := sc.getter.Get(key)
     if err != nil {
         return byteView{}, err
     }
 
     bv := byteView{bs: cloneBytes(bs)}
-    g.populateCache(key, bv)
+    sc.populateCache(key, bv)
     return bv, nil
 }
 
-func (g *Group) populateCache(key string, value byteView) {
-    g.mainCache.add(key, value)
+func (sc *StaticCache) populateCache(key string, value byteView) {
+    sc.mainCache.add(key, value)
 
-    for g.mainCache.bytes() > g.limit {
-        g.mainCache.removeOldest()
+    for sc.mainCache.bytes() > sc.limit {
+        sc.mainCache.removeOldest()
     }
 }
 
-// cache is concurrent secure LRUCache
-type cache struct {
+// syncLRU is a concurrent secure LRUCache
+type syncLRU struct {
     mu     sync.RWMutex
     lru    *lru.LRUCache[string]
     nbytes int64
 }
 
-func (c *cache) add(key string, value byteView) {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+func (sl *syncLRU) add(key string, value byteView) {
+    sl.mu.Lock()
+    defer sl.mu.Unlock()
 
-    if c.lru == nil {
-        c.lru = lru.New[string](0, func(key string, value any) {
-            c.nbytes -= int64(len(key)) + int64(value.(byteView).Len())
+    if sl.lru == nil {
+        sl.lru = lru.New[string](0, func(key string, value any) {
+            sl.nbytes -= int64(len(key)) + int64(value.(byteView).Len())
         })
     }
-    c.lru.Add(key, value)
-    c.nbytes += int64(len(key)) + int64(value.Len())
+    sl.lru.Add(key, value)
+    sl.nbytes += int64(len(key)) + int64(value.Len())
 }
 
-func (c *cache) get(key string) (byteView, bool) {
-    c.mu.RLock()
-    defer c.mu.RUnlock()
+func (sl *syncLRU) get(key string) (byteView, bool) {
+    sl.mu.RLock()
+    defer sl.mu.RUnlock()
 
-    if c.lru == nil {
+    if sl.lru == nil {
         return byteView{}, false
     }
 
-    if val, ok := c.lru.Get(key); ok {
+    if val, ok := sl.lru.Get(key); ok {
         return val.(byteView), ok
     }
     return byteView{}, false
 }
 
-func (c *cache) removeOldest() {
-    c.mu.Lock()
-    defer c.mu.Unlock()
+func (sl *syncLRU) removeOldest() {
+    sl.mu.Lock()
+    defer sl.mu.Unlock()
 
-    if c.lru != nil {
-        c.lru.RemoveOldest()
+    if sl.lru != nil {
+        sl.lru.RemoveOldest()
     }
 }
 
-func (c *cache) bytes() int64 {
-    c.mu.RLock()
-    defer c.mu.RUnlock()
+func (sl *syncLRU) bytes() int64 {
+    sl.mu.RLock()
+    defer sl.mu.RUnlock()
 
-    return c.nbytes
+    return sl.nbytes
+}
+
+// LocalGetter is the final data source.
+// When both the local cache and remote cache miss, trying to get data from LocalGetter.
+type LocalGetter interface {
+    Get(key string) ([]byte, error)
+}
+
+type GetterFunc func(key string) ([]byte, error)
+
+func (f GetterFunc) Get(key string) ([]byte, error) {
+    return f(key)
 }

@@ -1,6 +1,6 @@
 package staticcache
 
-// A byteView holds an immutable view of bytes.
+// byteView holds an immutable view of bytes.
 type byteView struct {
     bs []byte
 }
